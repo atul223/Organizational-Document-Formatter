@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Document Formatting Tool</title>
+<style>
+  :root {
+    --accent: #2f5496;
+    --accent-dark: #1f3a6e;
+    --bg: #f4f6f9;
+    --card: #ffffff;
+    --border: #d9dee6;
+    --text: #1c2733;
+    --muted: #6b7785;
+    --error: #b3261e;
+    --success: #1a7f37;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: "Segoe UI", Calibri, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    display: flex;
+    justify-content: center;
+    padding: 48px 16px;
+  }
+  .card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    max-width: 620px;
+    width: 100%;
+    padding: 32px;
+    box-shadow: 0 2px 10px rgba(0,0,0,0.04);
+  }
+  h1 {
+    font-size: 22px;
+    margin: 0 0 4px 0;
+    color: var(--accent-dark);
+  }
+  p.subtitle {
+    color: var(--muted);
+    margin: 0 0 28px 0;
+    font-size: 14px;
+  }
+  .field {
+    margin-bottom: 20px;
+  }
+  label {
+    display: block;
+    font-weight: 600;
+    font-size: 14px;
+    margin-bottom: 6px;
+  }
+  label .hint {
+    font-weight: 400;
+    color: var(--muted);
+    display: block;
+    font-size: 12.5px;
+    margin-top: 2px;
+  }
+  input[type="file"] {
+    width: 100%;
+    padding: 10px;
+    border: 1px dashed var(--border);
+    border-radius: 8px;
+    background: #fafbfc;
+    font-size: 13px;
+  }
+  button {
+    width: 100%;
+    padding: 12px;
+    background: var(--accent);
+    color: white;
+    border: none;
+    border-radius: 8px;
+    font-size: 15px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background 0.15s;
+  }
+  button:hover:not(:disabled) { background: var(--accent-dark); }
+  button:disabled { opacity: 0.6; cursor: not-allowed; }
+  #status {
+    margin-top: 18px;
+    font-size: 14px;
+    min-height: 20px;
+  }
+  #status.error { color: var(--error); }
+  #status.success { color: var(--success); }
+  .spinner {
+    display: inline-block;
+    width: 14px; height: 14px;
+    border: 2px solid #ccc;
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 0.7s linear infinite;
+    vertical-align: middle;
+    margin-right: 8px;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  footer {
+    margin-top: 24px;
+    font-size: 11.5px;
+    color: var(--muted);
+    text-align: center;
+  }
+</style>
+</head>
+<body>
+  <div class="card">
+    <h1>Document Formatting Tool</h1>
+    <p class="subtitle">Upload a reference document (with the formatting you want) and the document you'd like formatted to match it.</p>
+
+    <form id="formatForm">
+      <div class="field">
+        <label for="reference">Reference document
+          <span class="hint">The .docx whose formatting/style will be extracted.</span>
+        </label>
+        <input type="file" id="reference" name="reference" accept=".docx" required />
+      </div>
+
+      <div class="field">
+        <label for="target">Document to format
+          <span class="hint">The .docx that will be reformatted to match the reference above.</span>
+        </label>
+        <input type="file" id="target" name="target" accept=".docx" required />
+      </div>
+
+      <button type="submit" id="submitBtn">Format Document</button>
+      <div id="status"></div>
+    </form>
+
+    <footer>Internal tool &middot; files are processed on this server and not stored after download.</footer>
+  </div>
+
+<script>
+const form = document.getElementById('formatForm');
+const statusEl = document.getElementById('status');
+const submitBtn = document.getElementById('submitBtn');
+
+form.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const referenceFile = document.getElementById('reference').files[0];
+  const targetFile = document.getElementById('target').files[0];
+
+  if (!referenceFile || !targetFile) {
+    statusEl.textContent = 'Please choose both files.';
+    statusEl.className = 'error';
+    return;
+  }
+
+  const fd = new FormData();
+  fd.append('reference', referenceFile);
+  fd.append('target', targetFile);
+
+  submitBtn.disabled = true;
+  statusEl.className = '';
+  statusEl.innerHTML = '<span class="spinner"></span>Formatting document, please wait…';
+
+  try {
+    const resp = await fetch('/api/format', { method: 'POST', body: fd });
+
+    if (!resp.ok) {
+      let message = `Request failed (HTTP ${resp.status}).`;
+      try {
+        const errJson = await resp.json();
+        if (errJson.detail) message = errJson.detail;
+      } catch (_) { /* ignore parse errors */ }
+      throw new Error(message);
+    }
+
+    const blob = await resp.blob();
+    const disposition = resp.headers.get('Content-Disposition') || '';
+    let filename = 'formatted_output.docx';
+    const match = disposition.match(/filename="?([^"]+)"?/);
+    if (match) filename = match[1];
+
+    const url = window.URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    window.URL.revokeObjectURL(url);
+
+    statusEl.textContent = 'Done — your formatted document has downloaded.';
+    statusEl.className = 'success';
+  } catch (err) {
+    statusEl.textContent = err.message || 'Something went wrong.';
+    statusEl.className = 'error';
+  } finally {
+    submitBtn.disabled = false;
+  }
+});
+</script>
+</body>
+</html>

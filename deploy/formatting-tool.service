@@ -1,0 +1,21 @@
+[Unit]
+Description=Document Formatting Tool (FastAPI backend)
+After=network.target
+
+[Service]
+# --- EDIT THESE THREE LINES FOR YOUR SERVER ---
+User=formattingtool
+WorkingDirectory=/opt/formatting-tool/backend
+Environment="PATH=/opt/formatting-tool/backend/venv/bin"
+# ------------------------------------------------
+
+ExecStart=/opt/formatting-tool/backend/venv/bin/uvicorn app:app --host 127.0.0.1 --port 8000 --workers 2
+Restart=on-failure
+RestartSec=5
+
+# Basic hardening (safe defaults for an internal tool)
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

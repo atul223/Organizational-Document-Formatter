@@ -1,0 +1,9 @@
+# Pipeline dependencies (pinned to match the versions the tool was built
+# and verified against — see venv/ in the original project folder).
+python-docx==1.2.0
+lxml==6.1.2
+
+# Web server dependencies for the API wrapper.
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
+python-multipart==0.0.20
