@@ -121,6 +121,42 @@ def _looks_like_typed_heading_pattern(text):
     return bool(SECTION_BANNER_RE.match(text)) or bool(NUMBERING_RE.match(text))
 
 
+# v1.23 FIX: the v1.17 "untrusted inherited heading" guard was intended
+# to catch narrow TOC/index/outline-mechanics styles that are based on
+# a Heading style ONLY so Word's TOC field can pick them up (e.g. a
+# "TOC 1" style) - NOT real, organization-branded custom heading styles
+# (e.g. "CorpHeading2", "ProposalHeading1") that are extremely common
+# in real Word templates and rely on Word's own multilevel-list
+# auto-numbering (no literal digits in the paragraph's own text).
+#
+# Since this tool must now work correctly for ANY employee's reference
+# template (not a single fixed template), silently discarding a
+# perfectly valid, structurally-resolved heading role match just
+# because the style's own name isn't literally "Heading N" is no
+# longer acceptable - it directly contradicts the requirement that
+# formatting be derived ONLY and FULLY from what's actually present
+# in/inherited from the reference/target document's own style
+# hierarchy, with no arbitrary heuristic override discarding real
+# structural signal. The original v1.17 fix was far broader than its
+# stated intent and silently demoted EVERY custom-named heading-
+# derived style without a literal typed number to Body (at a high,
+# non-flagged 0.55-0.9 confidence), discarding a fully legitimate,
+# high-signal, structural match.
+#
+# This narrow denylist restores trust for legitimate custom heading
+# styles (the overwhelmingly common real-world case) while still
+# protecting against genuine TOC/index/outline-numbering styles the
+# original fix was designed for.
+_UNTRUSTED_STYLE_NAME_MARKERS = ("toc", "index", "outline numbered", "list number")
+
+
+def _is_style_name_genuinely_untrustworthy(style_name):
+    if not style_name:
+        return False
+    norm = style_name.strip().lower()
+    return any(marker in norm for marker in _UNTRUSTED_STYLE_NAME_MARKERS)
+
+
 def classify_paragraph(paragraph, body_baseline_pt=11.0, style_name=None,
                         resolved_role=None, resolved_role_depth=None,
                         special_heading_keys=None):
@@ -160,23 +196,19 @@ def classify_paragraph(paragraph, body_baseline_pt=11.0, style_name=None,
         came_from_style_chain = resolved_role is not None
 
     if claimed_role is not None:
-        # v1.17 FIX: a HEADING-role match found ONLY by walking UP a
-        # style's base_style ancestor chain (depth > 0) - i.e. the
-        # paragraph's OWN style is NOT literally named "Heading N"/
-        # "Title" - is no longer blindly trusted. Such styles are
-        # commonly custom outline/list-level styles based on a Heading
-        # purely for numbering-mechanics inheritance, not real document
-        # headings (see module docstring). Falls through to the
-        # general heuristic path below instead, UNLESS the paragraph's
-        # own text unmistakably looks like a real typed heading number
-        # (decimal x.y or "SECTION N"), in which case it is still
-        # trusted as before.
+        # v1.23 FIX (see module-level comment above _UNTRUSTED_STYLE_
+        # NAME_MARKERS for full rationale): a HEADING-role match found
+        # by walking UP a style's base_style ancestor chain (depth > 0)
+        # is now only distrusted if the style's OWN name genuinely
+        # looks like a TOC/index/outline-numbering mechanics style -
+        # not merely because it isn't literally named "Heading N".
         is_untrusted_inherited_heading = (
             came_from_style_chain
             and claimed_role in HEADING_ROLES
             and resolved_role_depth is not None
             and resolved_role_depth > 0
             and not _looks_like_typed_heading_pattern(text)
+            and _is_style_name_genuinely_untrustworthy(style_name)
         )
         if not is_untrusted_inherited_heading:
             if claimed_role in HEADING_ROLES and word_count > MAX_HEADING_WORDS:

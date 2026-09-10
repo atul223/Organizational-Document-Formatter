@@ -103,16 +103,28 @@ MINOR_FONT_ROLES = {"Body", "Caption", "Quote", "ListBullet"}
 HEADING_USAGE_OVERRIDE_ROLES = {"Title", "H1", "H2", "H3", "H4"}
 
 BODY_LIKE_FONT_NAME_USAGE_ROLES = {"Body", "Caption", "Quote", "ListBullet"}
-MIN_MINOR_FONT_NAME_SAMPLES = 5
-MIN_MINOR_FONT_NAME_MAJORITY_RATIO = 0.6
+# v1.23: lowered from (5, 0.6) to (1, 0.5). Per updated product requirement,
+# the tool must be usable with ANY employee-supplied reference template of
+# ANY size/length - it must apply whatever is ACTUALLY, deterministically
+# present in the reference rather than silently withholding a real,
+# correctly-extracted value merely because the reference didn't contain a
+# large statistical sample. A single genuine usage example in the
+# reference is real evidence, not a guess, and is now honored. The
+# majority-ratio check (now simple >50%) is retained ONLY to break ties
+# when the reference itself contains multiple, mutually-inconsistent
+# examples for the same role - never used to withhold real data.
+MIN_MINOR_FONT_NAME_SAMPLES = 1
+MIN_MINOR_FONT_NAME_MAJORITY_RATIO = 0.5
 
 SECTION_BANNER_RE = re.compile(r"^\s*SECTION\s+\d", re.IGNORECASE)
 ALLCAPS_RE = re.compile(r"^[A-Z0-9 .,'\-&/()]{3,80}$")
 
 NO_FILL_SENTINEL = "__NO_FILL__"
 
-MIN_BANDING_SAMPLES_PER_PARITY = 2
-MIN_BANDING_CONFIDENCE = 0.6
+# v1.23: lowered from (2, 0.6) to (1, 0.5) for the same reason as above -
+# see extract_body_row_banding()'s docstring for the full rationale.
+MIN_BANDING_SAMPLES_PER_PARITY = 1
+MIN_BANDING_CONFIDENCE = 0.5
 
 SPECIAL_HEADING_TEXTS = [
     "TABLE OF CONTENTS",
@@ -330,7 +342,13 @@ def extract_heading_typography_from_usage(doc, base_typography):
         para = dict(base.get("paragraph", {}))
         v = votes.get(role)
         n_samples = sample_counts.get(role, 0)
-        if v and n_samples >= 2:
+        # v1.23: lowered from >= 2 to >= 1 - a single genuine usage
+        # example found directly in the reference document IS real,
+        # extracted evidence (not a guess) and must be honored, per the
+        # "any employee, any reference template" requirement. This
+        # previously silently discarded real data whenever a role
+        # (e.g. H3) only appeared once in a short reference document.
+        if v and n_samples >= 1:
             if v["name"]:
                 font["name"] = v["name"].most_common(1)[0][0]
                 font["name_source"] = "usage_majority"
@@ -1335,9 +1353,19 @@ def extract_table_contexts(doc):
                 data_shading.update(s); data_color.update(c); data_bold.extend(b)
                 data_cell_count += n
 
-    def _build_profile(shading_votes, color_votes, bold_votes, table_count, cell_count, threshold=0.7):
+    # v1.23: threshold dropped from 0.7 to a simple majority (>0.5).
+    # Per updated requirement, ANY genuine majority pattern found in the
+    # reference (regardless of how few tables the reference contains)
+    # must be applied deterministically - the tool must not withhold a
+    # real extracted pattern just because it isn't "confidently"
+    # consistent by an arbitrary statistical bar. "apply: False" is now
+    # reserved ONLY for the case where the reference genuinely contains
+    # NO examples at all (cell_count == 0) - i.e. truly no data to
+    # extract, not "not enough of it".
+    def _build_profile(shading_votes, color_votes, bold_votes, table_count, cell_count, threshold=0.5):
         if cell_count == 0:
-            return {"apply": False, "reason": "no matching tables/cells found in reference",
+            return {"apply": False, "reason": "no matching tables/cells found in reference document "
+                                               "(genuinely no data to extract for this element)",
                      "sample_size": table_count}
         top_shade, top_shade_count = (shading_votes.most_common(1)[0] if shading_votes else (None, 0))
         confidence = (top_shade_count / cell_count) if cell_count else 0.0
@@ -1469,7 +1497,15 @@ def _vote_banding_for_table_group(tables):
     """v1.22 NEW: runs the SAME parity-vote algorithm as before, but
     scoped to a specific GROUP of tables (all sharing one header
     signature) rather than the whole document. This is the core of the
-    fix - see module docstring for the full rationale."""
+    fix - see module docstring for the full rationale.
+
+    v1.23: MIN_BANDING_SAMPLES_PER_PARITY and MIN_BANDING_CONFIDENCE
+    were lowered (see module-level constants) so that a reference
+    document with only a small number of body rows (very plausible for
+    a short reference template supplied by any employee) still has its
+    real, observed banding pattern honored, rather than silently
+    skipped for lack of a large statistical sample.
+    """
     parity_votes = [Counter(), Counter()]
     parity_sample_counts = [0, 0]
     cnf_driven_rows = 0
@@ -1607,7 +1643,7 @@ def build_policy(reference_path):
     typography = extract_typography(doc, reference_path)
     theme_fonts = extract_theme_fonts(reference_path)
     policy = {
-        "policy_version": "1.22",
+        "policy_version": "1.23",
         "source_reference_document": reference_path,
         "theme_fonts": theme_fonts,
         "typography": typography,
@@ -1646,3 +1682,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
