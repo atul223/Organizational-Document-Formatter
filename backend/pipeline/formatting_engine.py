@@ -47,7 +47,7 @@ from docx.oxml import OxmlElement
 from docx_fast import (
     build_styleid_to_name, get_paragraph_style_name_fast,
     count_header_rows, header_row_cells, dedupe_row_cells,
-    clear_cnf_style, table_header_signature,
+    clear_cnf_style, table_header_signature, iter_tables_recursive,
 )
 from ooxml_fonts import (
     set_run_font_safe, set_style_font_safe,
@@ -405,12 +405,11 @@ def _enforce_uniform_header_sizes(doc, header_profile, classification):
     runs_corrected = 0
     target_size_emu = Pt(size_pt)
 
-    for t_idx, table in enumerate(doc.tables):
-        ctx = table_context_by_index.get(t_idx, table_context_by_index.get(str(t_idx), "other"))
+    for path, table in iter_tables_recursive(doc):
+        ctx = table_context_by_index.get(path, "other")
         if ctx != "data_table" or not table.rows:
             continue
-        hdr_row_count = table_header_row_counts.get(
-            t_idx, table_header_row_counts.get(str(t_idx))) or count_header_rows(table)
+        hdr_row_count = table_header_row_counts.get(path) or count_header_rows(table)
         for cell in header_row_cells(table, hdr_row_count):
             cells_checked += 1
             for p in cell.paragraphs:
@@ -430,6 +429,12 @@ def _enforce_uniform_header_sizes(doc, header_profile, classification):
 
 
 def apply_table_typography(doc, table_typography, classification):
+    """v1.25: iterates ALL tables (top-level + nested at any depth) via
+    iter_tables_recursive, keyed by the SAME structural path strings
+    produced during classification - see docx_fast.iter_tables_
+    recursive() and structure_classifier.classify_document() for the
+    full rationale (fix for issue #3, inconsistent nested-table header
+    formatting)."""
     table_typography = table_typography or {}
     header_profile = table_typography.get("header")
     body_profile = table_typography.get("body")
@@ -438,14 +443,13 @@ def apply_table_typography(doc, table_typography, classification):
     header_cells_touched = 0
     body_cells_touched = 0
 
-    for t_idx, table in enumerate(doc.tables):
-        ctx = table_context_by_index.get(t_idx, table_context_by_index.get(str(t_idx), "other"))
+    for path, table in iter_tables_recursive(doc):
+        ctx = table_context_by_index.get(path, "other")
         if ctx != "data_table":
             continue
         if not table.rows:
             continue
-        hdr_row_count = table_header_row_counts.get(
-            t_idx, table_header_row_counts.get(str(t_idx))) or count_header_rows(table)
+        hdr_row_count = table_header_row_counts.get(path) or count_header_rows(table)
         for cell in header_row_cells(table, hdr_row_count):
             header_cells_touched += _apply_typography_profile_to_cell(cell, header_profile)
         for row in table.rows[hdr_row_count:]:
@@ -463,6 +467,7 @@ def apply_table_typography(doc, table_typography, classification):
 
 
 def apply_table_context_styles(doc, classification, table_contexts_policy):
+    """v1.25: nested-table-aware (see apply_table_typography docstring)."""
     table_context_by_index = classification.get("table_contexts", {})
     table_header_row_counts = classification.get("table_header_row_counts", {})
     tables_touched = {"banner": 0, "data_table": 0, "other_untouched": 0}
@@ -497,8 +502,8 @@ def apply_table_context_styles(doc, classification, table_contexts_policy):
                     sync_complex_script_size_and_emphasis(run)
         return True
 
-    for t_idx, table in enumerate(doc.tables):
-        ctx = table_context_by_index.get(t_idx, table_context_by_index.get(str(t_idx), "other"))
+    for path, table in iter_tables_recursive(doc):
+        ctx = table_context_by_index.get(path, "other")
 
         if ctx == "banner":
             if _apply_profile_to_cells(table.rows[0].cells if table.rows else [], banner_profile):
@@ -511,8 +516,7 @@ def apply_table_context_styles(doc, classification, table_contexts_policy):
             tables_touched["other_untouched"] += 1
             continue
 
-        hdr_row_count = table_header_row_counts.get(
-            t_idx, table_header_row_counts.get(str(t_idx))) or count_header_rows(table)
+        hdr_row_count = table_header_row_counts.get(path) or count_header_rows(table)
         cells = header_row_cells(table, hdr_row_count)
 
         if _apply_profile_to_cells(cells, data_profile):
@@ -524,13 +528,6 @@ def apply_table_context_styles(doc, classification, table_contexts_policy):
 
 
 def _apply_band_colors_to_table(table, hdr_row_count, band_colors):
-    """v1.22 NEW (extracted helper): applies a specific, already-
-    resolved [color0, color1] band-color pair to ONE table's body rows,
-    with the exact same per-parity direct-shading + defensive cnfStyle-
-    stripping logic used since v1.21 - unchanged in substance, just
-    factored out so it can be called once per table with whichever
-    profile (signature-matched or default-fallback) was selected for
-    that specific table."""
     body_rows = table.rows[hdr_row_count:]
     if not body_rows:
         return 0, 0
@@ -556,25 +553,9 @@ def _apply_band_colors_to_table(table, hdr_row_count, band_colors):
 
 
 def apply_table_body_row_banding(doc, row_banding_policy, classification):
-    """
-    v1.22: for EACH target table classified 'data_table', computes that
-    table's OWN header shape signature (docx_fast.table_header_
-    signature - the SAME function used during reference extraction, so
-    matching is exact and stable) and looks up the corresponding
-    reference profile from `row_banding_policy["by_signature"]` FIRST.
-    If no signature match is found, falls back to `row_banding_policy
-    ["default"]` (the old whole-document vote). Whichever profile is
-    selected (if it reports `apply: True`) is applied via the unchanged
-    `_apply_band_colors_to_table` helper.
-
-    This directly fixes the reported "no colors picked up at all"
-    regression: a target table whose header exactly matches a
-    confidently-detected reference table family (e.g. every "No. |
-    Activity | Description | Timing" table) now correctly receives that
-    family's OWN, cleanly-detected banding pattern - completely
-    independent of whether some OTHER, differently-shaped table
-    elsewhere in the reference has its own distinct (or no) pattern.
-    """
+    """v1.25: nested-table-aware (see apply_table_typography docstring).
+    Signature-based matching is already location-independent, so nested
+    tables benefit automatically once they're included in the traversal."""
     result = {"applied": False, "tables_touched": 0, "rows_touched": 0, "cells_touched": 0,
               "tables_matched_by_signature": 0, "tables_matched_by_default_fallback": 0,
               "tables_with_no_applicable_profile": 0}
@@ -596,25 +577,17 @@ def apply_table_body_row_banding(doc, row_banding_policy, classification):
     matched_by_default = 0
     no_applicable_profile = 0
 
-    for t_idx, table in enumerate(doc.tables):
-        ctx = table_context_by_index.get(t_idx, table_context_by_index.get(str(t_idx), "other"))
+    for path, table in iter_tables_recursive(doc):
+        ctx = table_context_by_index.get(path, "other")
         if ctx != "data_table" or not table.rows:
             continue
-        hdr_row_count = table_header_row_counts.get(
-            t_idx, table_header_row_counts.get(str(t_idx))) or count_header_rows(table)
+        hdr_row_count = table_header_row_counts.get(path) or count_header_rows(table)
 
         sig = table_header_signature(table, hdr_row_count)
         profile = by_signature.get(sig) if sig is not None else None
         matched_via = "signature"
         if profile is None or not profile.get("apply"):
             if profile is not None and not profile.get("apply"):
-                # This table's OWN shape was seen in the reference and
-                # confidently determined to have NO simple alternating
-                # pattern (e.g. its own distinct per-row color scheme,
-                # or genuinely uniform rows) - respect that finding
-                # exactly; do NOT fall back to the generic default for
-                # a shape we already have specific, confident
-                # information about.
                 no_applicable_profile += 1
                 continue
             profile = default_profile
@@ -649,13 +622,12 @@ def apply_table_body_row_banding(doc, row_banding_policy, classification):
     result["reason"] = (f"applied per-table-shape banding to {tables_touched} data table(s) "
                         f"({matched_by_signature} matched a specific reference table shape, "
                         f"{matched_by_default} used the whole-document fallback pattern); "
-                        f"{no_applicable_profile} table(s) had no applicable banding pattern "
-                        f"(either their shape has its own distinct/non-alternating reference "
-                        f"coloring, or no pattern could be confidently determined)")
+                        f"{no_applicable_profile} table(s) had no applicable banding pattern")
     return result
 
 
 def apply_special_table_cell_formatting(doc, classification, typography):
+    """v1.25: nested-table-aware (see apply_table_typography docstring)."""
     style_cache = {}
     for style_name in set(ROLE_TO_STYLE_NAME.values()):
         try:
@@ -668,11 +640,11 @@ def apply_special_table_cell_formatting(doc, classification, typography):
     for r in classification.get("table_cell_paragraphs", []):
         by_key[(r["table_index"], r["row"], r["col"], r["para"])] = r
 
-    for t_idx, table in enumerate(doc.tables):
+    for path, table in iter_tables_recursive(doc):
         for r_idx, row in enumerate(table.rows):
             for c_idx, cell in enumerate(row.cells):
                 for p_idx, p in enumerate(cell.paragraphs):
-                    key = (t_idx, r_idx, c_idx, p_idx)
+                    key = (path, r_idx, c_idx, p_idx)
                     result = by_key.get(key)
                     if not result:
                         continue
@@ -685,7 +657,7 @@ def apply_special_table_cell_formatting(doc, classification, typography):
                         p.style = target_style
                     _normalize_runs_direct_formatting(p, role, typography)
                     change_log.append({
-                        "table_index": t_idx, "row": r_idx, "col": c_idx, "para": p_idx,
+                        "table_index": path, "row": r_idx, "col": c_idx, "para": p_idx,
                         "role": role, "method": result["method"],
                         "text_preview": result["text_preview"],
                     })
@@ -1059,8 +1031,7 @@ def apply_footer_design(doc, footer_design, cached_page_display="1"):
                                        usable_width_emu=usable_width_emu)
                 instances_touched += 1
         return {"applied": True, "sections_touched": instances_touched,
-                "reason": "Reference footer's full table layout (cell text, alignment, shading, font, "
-                          "and a genuine auto-updating PAGE field) was replicated exactly into every "
+                "reason": "Reference footer's full table layout was replicated exactly into every "
                           "footer instance in the target document."}
 
     if footer_design.get("page_field_in_table") or footer_design.get("page_field_in_shape"):
@@ -1186,3 +1157,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

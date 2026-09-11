@@ -83,6 +83,7 @@ from docx_fast import (
     BUILTIN_STYLE_TO_ROLE, build_styleid_to_name, build_styleid_to_role_map,
     get_raw_pstyle_id, count_header_rows, header_row_cells, dedupe_row_cells,
     read_row_cnf_band, read_cell_cnf_band, table_header_signature,
+    iter_tables_recursive,
 )
 
 ROLE_STYLE_CANDIDATES = {
@@ -100,39 +101,56 @@ ROLE_STYLE_CANDIDATES = {
 MAJOR_FONT_ROLES = {"Title", "H1", "H2", "H3", "H4"}
 MINOR_FONT_ROLES = {"Body", "Caption", "Quote", "ListBullet"}
 
-# v1.24 FIX: previously only MAJOR_FONT_ROLES (headings) were subject to
-# usage-based majority-vote override of the (possibly stale) style
-# definition. Body/Caption/Quote/ListBullet were left on style-definition
-# values ONLY, which silently produced wrong output whenever a reference
-# document's "Normal"/etc. style definition was stale (e.g. style says
-# "Arial 9.5" but every actual paragraph in the document has been
-# manually/directly formatted to "Times New Roman 11", which is what a
-# human actually sees when opening the file). Per the explicit
-# requirement that the tool must reproduce "whatever is visible in the
-# reference document actually... without any discrepancies", usage-based
-# override now applies to EVERY typography role, not just headings.
 ALL_TYPOGRAPHY_USAGE_OVERRIDE_ROLES = MAJOR_FONT_ROLES | MINOR_FONT_ROLES
-# Back-compat alias (kept in case anything external referenced the old
-# name) - identical set, just scoped to heading roles conceptually.
 HEADING_USAGE_OVERRIDE_ROLES = MAJOR_FONT_ROLES
 
 BODY_LIKE_FONT_NAME_USAGE_ROLES = {"Body", "Caption", "Quote", "ListBullet"}
-# v1.23: lowered from (5, 0.6) to (1, 0.5) - see extract_minor_role_font_
-# name_from_usage() docstring. This function is now mostly a SECONDARY
-# safety net (see v1.24 change above, which already handles the primary
-# case via full usage-based override), retained for the rare edge case
-# where a role has literally zero paragraphs resolving to it anywhere
-# in the reference document.
 MIN_MINOR_FONT_NAME_SAMPLES = 1
 MIN_MINOR_FONT_NAME_MAJORITY_RATIO = 0.5
+
+# v1.25 FIX (issues #2 and #4 - "yellow/inconsistent body text color"):
+# Word ships several BUILT-IN styles (e.g. "Subtitle") that structurally
+# inherit from "Normal" (so docx_fast.resolve_base_style_role correctly
+# walks up their base_style chain and lands on "Body"), but which are
+# semantically DISTINCT, one-off editorial/decorative elements - NOT
+# representative body prose. A reference document typically contains
+# only ONE such paragraph (e.g. a single italic/colored subtitle line
+# under the cover title), so if it happens to carry its own explicit
+# color (a very common real-world authoring choice, since subtitles are
+# deliberately styled differently from body text), that single sample
+# becomes the ENTIRE usage-vote "majority" for Body typography under the
+# v1.24 fix - incorrectly painting all real body text with a color/
+# font meant only for that one decorative line. This is a genuine,
+# confirmed root cause (traced directly to the reference document's own
+# "Subtitle"-styled line), not a hypothetical edge case.
+#
+# The fix below EXCLUDES known non-prose, semantically-distinct built-in
+# Word style names from contributing to Body-role usage voting, while
+# leaving ALL other usage-voting behavior (including the "one real
+# sample is enough evidence" principle established for the "any
+# reference template" requirement) completely untouched. This is
+# intentionally scoped ONLY to the Body role and ONLY to well-known,
+# non-generic Word style names - it does not affect heading roles
+# (which already have their own, separately-vetted resolution logic)
+# and does not reintroduce any statistical-sample-size threshold.
+DISTINCT_NON_BODY_STYLE_NAMES = {
+    "subtitle", "date", "signature", "salutation", "closing",
+    "e-mail signature", "envelope address", "envelope return",
+    "message header",
+}
+
+
+def _is_distinct_non_body_style(style_name):
+    if not style_name:
+        return False
+    return style_name.strip().lower() in DISTINCT_NON_BODY_STYLE_NAMES
+
 
 SECTION_BANNER_RE = re.compile(r"^\s*SECTION\s+\d", re.IGNORECASE)
 ALLCAPS_RE = re.compile(r"^[A-Z0-9 .,'\-&/()]{3,80}$")
 
 NO_FILL_SENTINEL = "__NO_FILL__"
 
-# v1.23: lowered from (2, 0.6) to (1, 0.5) for the same reason as above -
-# see extract_body_row_banding()'s docstring for the full rationale.
 MIN_BANDING_SAMPLES_PER_PARITY = 1
 MIN_BANDING_CONFIDENCE = 0.5
 
@@ -154,13 +172,6 @@ SPECIAL_HEADING_TEXTS = [
 
 TOC_HEADING_NORM = "TABLE OF CONTENTS"
 
-# v1.24: this word-count cap is now ONLY applied to heading-like roles
-# (see ROLES_WITH_USAGE_WORD_COUNT_LIMIT below). It exists to stop a
-# long, misclassified paragraph from skewing a HEADING's usage vote
-# (headings are, by nature, short). Body/Caption/Quote/ListBullet text
-# is legitimately long and must be sampled regardless of length -
-# otherwise the vast majority of real body paragraphs would be
-# excluded from the vote, defeating the fix's whole purpose.
 MAX_USAGE_SAMPLE_WORDS = 20
 ROLES_WITH_USAGE_WORD_COUNT_LIMIT = MAJOR_FONT_ROLES
 
@@ -233,15 +244,137 @@ def _paragraph_props(style):
     return out
 
 
+# ---------------------------------------------------------------------
+# v1.25 NEW (issue #1 - "Aptos font appearing"): resolves the EFFECTIVE
+# font/paragraph properties Word would actually RENDER for a given
+# style, by walking that style's own base_style ancestor chain and
+# taking the first non-None value found for each property. This is
+# needed because many real-world reference documents leave certain
+# properties (very commonly the font NAME) completely unset at the
+# style level, relying entirely on the style's ancestor chain -> the
+# document's THEME to render the visible font. A direct, literal-only
+# read of a single style's own definition can therefore come back
+# entirely empty even though Word renders a perfectly well-defined,
+# visible font for it - and leaving that property as None caused
+# downstream formatting code to skip setting it entirely, silently
+# leaving whatever font the TARGET document happened to already have
+# (e.g. Word's newer default "Aptos") completely untouched.
+# ---------------------------------------------------------------------
+def _style_own_theme_font_ref(style):
+    """python-docx's Font.name property ONLY ever reads the LITERAL
+    <w:rFonts w:ascii="..."> attribute - it returns None whenever a
+    style's run-properties set only a THEME font reference (e.g.
+    <w:rFonts w:asciiTheme="majorHAnsi"/>), even though Word visually
+    renders that theme font perfectly well. Without checking for this
+    directly at the raw-XML level, a style-chain walk that treats
+    "font.name is None" as "this style sets no font at all" would
+    incorrectly skip PAST a style that legitimately sets a theme font
+    (extremely common for "Title"/heading styles specifically) and
+    instead pick up a less-specific ANCESTOR style's literal font -
+    which is the WRONG font per Word's actual cascade priority (the
+    nearest/most-specific style in the chain always wins for whatever
+    it defines, whether literal or theme-based).
+
+    Returns "major", "minor", or None."""
+    try:
+        rPr = style.element.rPr
+    except Exception:
+        return None
+    if rPr is None:
+        return None
+    rFonts = rPr.find(qn('w:rFonts'))
+    if rFonts is None:
+        return None
+    theme_val = rFonts.get(qn('w:asciiTheme')) or rFonts.get(qn('w:hAnsiTheme'))
+    if not theme_val:
+        return None
+    theme_val_lower = theme_val.lower()
+    if "major" in theme_val_lower:
+        return "major"
+    if "minor" in theme_val_lower:
+        return "minor"
+    return None
+
+
+def _resolve_effective_style_font(style, theme_fonts=None, max_depth=15):
+    theme_fonts = theme_fonts or {}
+    result = {"name": None, "size_pt": None, "bold": None, "italic": None,
+              "color_hex": None, "underline": None}
+    seen_ids = set()
+    current = style
+    depth = 0
+    while current is not None and depth < max_depth and any(v is None for v in result.values()):
+        f = getattr(current, "font", None)
+        if f is not None:
+            if result["name"] is None:
+                try:
+                    if f.name:
+                        result["name"] = f.name
+                        result["name_source"] = "style_chain_literal"
+                except Exception:
+                    pass
+                # v1.25: if THIS level's own rPr sets a THEME font
+                # reference (and no literal font was found above), that
+                # theme reference takes priority over any ancestor's
+                # literal font - resolve it now and stop walking for
+                # "name" specifically.
+                if result["name"] is None:
+                    theme_ref = _style_own_theme_font_ref(current)
+                    if theme_ref == "major" and theme_fonts.get("major_latin"):
+                        result["name"] = theme_fonts["major_latin"]
+                        result["name_source"] = "style_chain_theme_major"
+                    elif theme_ref == "minor" and theme_fonts.get("minor_latin"):
+                        result["name"] = theme_fonts["minor_latin"]
+                        result["name_source"] = "style_chain_theme_minor"
+            if result["size_pt"] is None:
+                try:
+                    if f.size:
+                        result["size_pt"] = f.size.pt
+                except Exception:
+                    pass
+            if result["bold"] is None:
+                try:
+                    if f.bold is not None:
+                        result["bold"] = f.bold
+                except Exception:
+                    pass
+            if result["italic"] is None:
+                try:
+                    if f.italic is not None:
+                        result["italic"] = f.italic
+                except Exception:
+                    pass
+            if result["color_hex"] is None:
+                try:
+                    if f.color and f.color.type is not None and f.color.rgb:
+                        result["color_hex"] = str(f.color.rgb)
+                except Exception:
+                    pass
+            if result["underline"] is None:
+                try:
+                    if f.underline is not None:
+                        result["underline"] = bool(f.underline)
+                except Exception:
+                    pass
+        style_id = getattr(current, "style_id", None)
+        if style_id is not None:
+            if style_id in seen_ids:
+                break
+            seen_ids.add(style_id)
+        try:
+            current = current.base_style
+        except Exception:
+            break
+        depth += 1
+    return result
+
+
 def extract_typography_from_style_defs(doc, reference_path):
     """Baseline pass: reads each role's STYLE DEFINITION (e.g. what
     Word's 'Normal' style itself declares). This is later treated only
     as a fallback baseline - see extract_typography_from_usage() below,
     which overrides these values with what's ACTUALLY, visibly used in
-    the document whenever real usage data is available, since a style
-    definition can be stale/never-updated even though every real
-    paragraph in the document has direct/manual formatting on top of
-    it (a very common real-world Word authoring pattern)."""
+    the document whenever real usage data is available."""
     styles_by_name = {s.name: s for s in doc.styles}
     typography = {}
     for role, candidates in ROLE_STYLE_CANDIDATES.items():
@@ -295,33 +428,25 @@ def extract_typography_from_style_defs(doc, reference_path):
 
 
 def extract_typography_from_usage(doc, base_typography):
-    """v1.24 RENAMED + EXPANDED (was extract_heading_typography_from_
-    usage, and only ever examined HEADING roles). This function now
-    examines EVERY typography role - Title/H1-H4 AND Body/Caption/
-    Quote/ListBullet - and, for each role, votes on the font/paragraph
-    properties ACTUALLY applied via direct/manual run-level formatting
-    across every matching paragraph in the reference document.
+    """Examines EVERY typography role - Title/H1-H4 AND Body/Caption/
+    Quote/ListBullet - and votes on the font/paragraph properties
+    ACTUALLY applied via direct/manual run-level formatting across
+    every matching paragraph in the reference document, overriding a
+    (possibly stale) style-definition baseline. A single genuine usage
+    example is sufficient evidence per the "any employee, any reference
+    template" requirement.
 
-    Rationale (root cause of the "Arial 9.5 instead of Times New Roman
-    11" bug): a paragraph style's own definition (e.g. 'Normal') can be
-    stale - authored once, then never updated - while every real
-    paragraph using that style has since been manually reformatted
-    (e.g. selecting all body text and changing the font). Word renders
-    the direct/manual formatting, so THAT is what a human actually sees
-    as "the reference document's formatting" - not the stale style
-    default. Since the tool's mandate is to reproduce exactly what is
-    visibly present in the reference with no discrepancies, usage
-    (i.e. what's actually applied, majority-voted across every real
-    paragraph) must always take priority over a style definition
-    whenever real usage data exists - for ALL roles, not only headings.
-
-    A single genuine usage example is sufficient evidence (n_samples
-    >= 1) per the "any employee, any reference template" requirement -
-    even a short reference document's real, observed formatting must
-    be honored rather than silently discarded for lack of a large
-    statistical sample.
+    v1.25 FIX: paragraphs whose OWN literal style is a known, distinct,
+    non-generic-prose built-in Word style (e.g. "Subtitle") are EXCLUDED
+    from contributing to Body-role usage voting, even though such
+    styles structurally inherit the Body role via their base_style
+    ancestor chain - see DISTINCT_NON_BODY_STYLE_NAMES above for the
+    full, directly-confirmed rationale (a single decorative/editorial
+    "Subtitle" line was incorrectly hijacking the entire document's
+    Body text color).
     """
     styleid_to_role = build_styleid_to_role_map(doc, BUILTIN_STYLE_TO_ROLE)
+    styleid_to_name = build_styleid_to_name(doc)
 
     votes = {role: {
         "name": Counter(), "size_pt": Counter(), "color_hex": Counter(),
@@ -335,25 +460,17 @@ def extract_typography_from_usage(doc, base_typography):
         if not text:
             continue
         style_id = get_raw_pstyle_id(p)
-        # v1.24 FIX: Word/python-docx frequently omits the explicit
-        # <w:pStyle> element entirely for paragraphs using the
-        # DEFAULT "Normal" style (it's the implicit default per the
-        # OOXML spec, so there's often nothing to write). The old
-        # "if style_id else None" pattern silently treated every such
-        # paragraph as having NO resolvable role at all, excluding the
-        # overwhelming majority of real body text from usage voting -
-        # defeating this entire fix for exactly the most common case.
-        # A missing style_id must resolve to "Body" (matching
-        # BUILTIN_STYLE_TO_ROLE["Normal"] == "Body"), not to "no role".
         if style_id is None:
             role = "Body"
+            own_style_name = "Normal"
         else:
             role = styleid_to_role.get(style_id)
+            own_style_name = styleid_to_name.get(style_id, "")
         if role is None or role not in ALL_TYPOGRAPHY_USAGE_OVERRIDE_ROLES:
             continue
-        # v1.24: the word-count cap is only meaningful/applied for
-        # heading-like roles (see constant definition above); body-like
-        # roles sample every paragraph regardless of length.
+        # v1.25 FIX: exclude distinct non-prose styles from Body voting.
+        if role == "Body" and _is_distinct_non_body_style(own_style_name):
+            continue
         if role in ROLES_WITH_USAGE_WORD_COUNT_LIMIT and len(text.split()) > MAX_USAGE_SAMPLE_WORDS:
             continue
         rep_run = next((r for r in p.runs if r.text.strip()), None)
@@ -413,11 +530,6 @@ def extract_typography_from_usage(doc, base_typography):
         para = dict(base.get("paragraph", {}))
         v = votes.get(role)
         n_samples = sample_counts.get(role, 0)
-        # v1.23/v1.24: a single genuine usage example (n_samples >= 1)
-        # is real, extracted evidence - not a guess - and OVERRIDES the
-        # (possibly stale) style-definition baseline. This is the
-        # direct fix for the "Body style says Arial 9.5, but every
-        # actual paragraph is Times New Roman 11" class of bug.
         if v and n_samples >= 1:
             if v["name"]:
                 font["name"] = v["name"].most_common(1)[0][0]
@@ -449,15 +561,10 @@ def extract_typography_from_usage(doc, base_typography):
 
 
 def extract_minor_role_font_name_from_usage(doc, typography):
-    """SECONDARY safety net only (see extract_typography_from_usage()
-    above, which is now the PRIMARY mechanism and already covers this
-    case for any role with at least one real paragraph in the
-    document). This function only ever fires if a role's font name is
-    STILL empty after that primary pass - i.e. the role has literally
-    zero paragraphs resolving to it anywhere in the reference document
-    - in which case it re-scans using a slightly different resolution
-    path as a last-resort cross-check before falling back to theme/
-    body-inherited defaults."""
+    """SECONDARY safety net only - fires only if a role's font name is
+    STILL empty after the primary usage pass above (i.e. the role has
+    literally zero qualifying paragraphs anywhere in the reference
+    document)."""
     roles_needing_fallback = {
         role for role in BODY_LIKE_FONT_NAME_USAGE_ROLES
         if not typography.get(role, {}).get("font", {}).get("name")
@@ -466,19 +573,22 @@ def extract_minor_role_font_name_from_usage(doc, typography):
         return typography
 
     styleid_to_role = build_styleid_to_role_map(doc, BUILTIN_STYLE_TO_ROLE)
+    styleid_to_name = build_styleid_to_name(doc)
     votes = {role: Counter() for role in roles_needing_fallback}
     total_runs_examined = Counter()
 
     for p in doc.paragraphs:
         style_id = get_raw_pstyle_id(p)
-        # v1.24 FIX: same None-style_id fix as in extract_typography_
-        # from_usage() above - see that function's inline comment for
-        # the full rationale.
         if style_id is None:
             role = "Body"
+            own_style_name = "Normal"
         else:
             role = styleid_to_role.get(style_id)
+            own_style_name = styleid_to_name.get(style_id, "")
         if role is None or role not in roles_needing_fallback:
+            continue
+        # v1.25 FIX: same exclusion as the primary pass above.
+        if role == "Body" and _is_distinct_non_body_style(own_style_name):
             continue
         for r in p.runs:
             if not r.text.strip():
@@ -509,14 +619,31 @@ def extract_minor_role_font_name_from_usage(doc, typography):
 
 def extract_typography(doc, reference_path):
     base = extract_typography_from_style_defs(doc, reference_path)
-    # v1.24: usage-based override now runs for ALL roles (headings AND
-    # body-like), not just headings - see extract_typography_from_usage().
     with_usage = extract_typography_from_usage(doc, base)
     final = extract_minor_role_font_name_from_usage(doc, with_usage)
     return final
 
 
-def extract_special_headings(doc):
+def extract_special_headings(doc, theme_fonts=None, fallback_font_name=None, fallback_size_pt=None):
+    """v1.25 FIX (issue #1 - Aptos font appearing): for each matched
+    special front-matter heading (e.g. "TABLE OF CONTENTS"), the
+    representative run's OWN literal font properties are read first
+    (unchanged). But whenever a property comes back None - which is
+    very common for the font NAME specifically, since many real-world
+    templates leave headings' fonts entirely theme-driven rather than
+    literally set - the property is now resolved via the paragraph's
+    OWN style ancestor chain (_resolve_effective_style_font), which is
+    exactly what Word itself renders. If the font NAME is still
+    unresolved after that (i.e. neither the run nor any style in its
+    ancestor chain ever sets one - fully theme-only), it falls back to
+    the reference document's theme MAJOR font (front-matter special
+    headings are heading-like elements), then finally to the already-
+    resolved Body font name as a last resort. This ensures a concrete,
+    correct font name is always captured - never left as None, which
+    previously caused the formatting engine to silently skip setting
+    the font at all, leaving the TARGET document's own (possibly
+    unrelated, e.g. "Aptos") font completely untouched."""
+    theme_fonts = theme_fonts or {}
     known_set = {_normalize_heading_text(t) for t in SPECIAL_HEADING_TEXTS}
     found = {}
     for p in doc.paragraphs:
@@ -551,6 +678,31 @@ def extract_special_headings(doc):
                 font_props["underline"] = bool(rep_run.font.underline)
             except Exception:
                 font_props["underline"] = None
+
+            # v1.25: fill any still-empty properties via the paragraph's
+            # own style ancestor chain (what Word actually renders).
+            if any(font_props.get(k) is None for k in ("name", "size_pt", "bold", "italic", "color_hex")):
+                try:
+                    effective = _resolve_effective_style_font(p.style, theme_fonts=theme_fonts)
+                except Exception:
+                    effective = {}
+                for k in ("name", "size_pt", "bold", "italic", "color_hex", "underline"):
+                    if font_props.get(k) is None and effective.get(k) is not None:
+                        font_props[k] = effective[k]
+                        font_props[f"{k}_source"] = "style_chain_effective"
+
+            # v1.25: final fallback for font NAME only - theme major,
+            # then the already-resolved Body font name.
+            if not font_props.get("name"):
+                if theme_fonts.get("major_latin"):
+                    font_props["name"] = theme_fonts["major_latin"]
+                    font_props["name_source"] = "theme_major_fallback"
+                elif fallback_font_name:
+                    font_props["name"] = fallback_font_name
+                    font_props["name_source"] = "body_font_fallback"
+            if not font_props.get("size_pt") and fallback_size_pt:
+                font_props["size_pt"] = fallback_size_pt
+                font_props["size_source"] = "body_size_fallback"
 
             pf = p.paragraph_format
             para_props = {}
@@ -1410,6 +1562,11 @@ def _vote_cell_group(cells, table):
 
 
 def extract_table_contexts(doc):
+    """v1.25: now traverses NESTED tables too (via iter_tables_recursive),
+    so a reference document's own per-candidate sub-tables (e.g. a
+    "Team Leader / Sanitary Engineer / ..." staffing table nested
+    inside a larger project cell) contribute to - and correctly
+    receive - the same header-shading pattern as top-level data tables."""
     banner_shading = Counter()
     banner_color = Counter()
     banner_bold = []
@@ -1422,7 +1579,7 @@ def extract_table_contexts(doc):
     data_table_count = 0
     data_cell_count = 0
 
-    for tbl in doc.tables:
+    for _path, tbl in iter_tables_recursive(doc):
         ctx = _classify_reference_table_context(tbl)
         if ctx is None:
             continue
@@ -1441,12 +1598,6 @@ def extract_table_contexts(doc):
                 data_shading.update(s); data_color.update(c); data_bold.extend(b)
                 data_cell_count += n
 
-    # v1.23: threshold dropped from 0.7 to a simple majority (>0.5).
-    # Per updated requirement, ANY genuine majority pattern found in the
-    # reference (regardless of how few tables the reference contains)
-    # must be applied deterministically. "apply: False" is now reserved
-    # ONLY for the case where the reference genuinely contains NO
-    # examples at all (cell_count == 0).
     def _build_profile(shading_votes, color_votes, bold_votes, table_count, cell_count, threshold=0.5):
         if cell_count == 0:
             return {"apply": False, "reason": "no matching tables/cells found in reference document "
@@ -1477,6 +1628,8 @@ def extract_table_contexts(doc):
 
 
 def extract_table_typography(doc, theme_fonts=None, body_font_props=None):
+    """v1.25: now traverses nested tables too - see extract_table_
+    contexts() docstring for the full rationale."""
     theme_fonts = theme_fonts or {}
     body_font_props = body_font_props or {}
     fallback_font_name = body_font_props.get("name") or theme_fonts.get("minor_latin")
@@ -1486,7 +1639,7 @@ def extract_table_typography(doc, theme_fonts=None, body_font_props=None):
         names, sizes = Counter(), Counter()
         sample_size = 0
         bare_cells = 0
-        for tbl in doc.tables:
+        for _path, tbl in iter_tables_recursive(doc):
             ctx = _classify_reference_table_context(tbl)
             if ctx != "data_table":
                 continue
@@ -1522,7 +1675,7 @@ def extract_table_typography(doc, theme_fonts=None, body_font_props=None):
     def _body_profile():
         names, sizes, colors = Counter(), Counter(), Counter()
         sample_size = 0
-        for tbl in doc.tables:
+        for _path, tbl in iter_tables_recursive(doc):
             ctx = _classify_reference_table_context(tbl)
             if ctx != "data_table":
                 continue
@@ -1579,16 +1732,6 @@ def _row_effective_shading_or_none(row, table, body_row_parity):
 
 
 def _vote_banding_for_table_group(tables):
-    """v1.22 NEW: runs the SAME parity-vote algorithm as before, but
-    scoped to a specific GROUP of tables (all sharing one header
-    signature) rather than the whole document.
-
-    v1.23: MIN_BANDING_SAMPLES_PER_PARITY and MIN_BANDING_CONFIDENCE
-    were lowered so that a reference document with only a small number
-    of body rows still has its real, observed banding pattern honored,
-    rather than silently skipped for lack of a large statistical
-    sample.
-    """
     parity_votes = [Counter(), Counter()]
     parity_sample_counts = [0, 0]
     cnf_driven_rows = 0
@@ -1632,8 +1775,7 @@ def _vote_banding_for_table_group(tables):
             "apply": False,
             "reason": (f"body-row shading not consistent enough for this table shape to confirm a "
                        f"banding pattern (confidence0={confidence0:.2f}, confidence1={confidence1:.2f}, "
-                       f"need >= {MIN_BANDING_CONFIDENCE}) - likely a table with its own distinct, "
-                       f"non-alternating per-row color scheme rather than simple banding"),
+                       f"need >= {MIN_BANDING_CONFIDENCE})"),
             "tables_in_group": tables_with_body_rows,
             "cnf_style_corrections": cnf_driven_rows,
         }
@@ -1663,15 +1805,11 @@ def _vote_banding_for_table_group(tables):
 
 
 def extract_body_row_banding(doc):
-    """
-    v1.22: GROUPS all reference data tables by their own header "shape
-    signature" and runs the parity-vote banding algorithm SEPARATELY,
-    per group. Also computes a single "default" fallback profile (the
-    OLD whole-document vote across every table) for target tables
-    whose header signature matches nothing seen in the reference.
-    """
+    """v1.25: now traverses nested tables too via iter_tables_recursive
+    (path is unused here since grouping is by header signature, which
+    is already location-independent)."""
     groups = {}
-    for tbl in doc.tables:
+    for _path, tbl in iter_tables_recursive(doc):
         ctx = _classify_reference_table_context(tbl)
         if ctx != "data_table":
             continue
@@ -1685,7 +1823,8 @@ def extract_body_row_banding(doc):
     for sig, tables in groups.items():
         by_signature[sig] = _vote_banding_for_table_group(tables)
 
-    all_data_tables = [tbl for tbl in doc.tables if _classify_reference_table_context(tbl) == "data_table"]
+    all_data_tables = [tbl for _path, tbl in iter_tables_recursive(doc)
+                        if _classify_reference_table_context(tbl) == "data_table"]
     default_profile = _vote_banding_for_table_group(all_data_tables)
     default_profile["reason"] = (default_profile.get("reason", "") +
                                  " [whole-document fallback profile, used only when a target table's "
@@ -1714,11 +1853,18 @@ def extract_numbering_hint(doc):
 
 def build_policy(reference_path):
     doc = Document(reference_path)
-    special_headings = extract_special_headings(doc)
-    typography = extract_typography(doc, reference_path)
     theme_fonts = extract_theme_fonts(reference_path)
+    typography = extract_typography(doc, reference_path)
+    # v1.25: extract_special_headings now needs theme_fonts + the
+    # already-resolved Body font name as fallback inputs - see that
+    # function's docstring for the full rationale (fix for issue #1,
+    # "Aptos font appearing").
+    special_headings = extract_special_headings(
+        doc, theme_fonts=theme_fonts,
+        fallback_font_name=typography.get("Body", {}).get("font", {}).get("name"),
+        fallback_size_pt=typography.get("Body", {}).get("font", {}).get("size_pt"))
     policy = {
-        "policy_version": "1.24",
+        "policy_version": "1.25",
         "source_reference_document": reference_path,
         "theme_fonts": theme_fonts,
         "typography": typography,
@@ -1752,12 +1898,13 @@ def main():
     for role in ("Title", "H1", "H2", "H3", "H4", "Body", "Caption", "Quote", "ListBullet"):
         f = typ.get(role, {}).get("font", {})
         print(f"  {role}: font={f.get('name')} (source: {f.get('name_source', 'style_default')}), "
-              f"size={f.get('size_pt')}pt (source: {f.get('size_source', 'style_default')}), "
+              f"size={f.get('size_pt')}pt, color=#{f.get('color_hex')}, "
               f"usage_samples={typ.get(role, {}).get('usage_sample_size', 0)}")
 
 
 if __name__ == "__main__":
     main()
+
 
 
 

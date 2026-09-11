@@ -57,7 +57,7 @@ from docx import Document
 from docx_fast import (
     BUILTIN_STYLE_TO_ROLE, build_styleid_to_name, get_paragraph_style_name_fast,
     get_raw_pstyle_id, build_styleid_to_role_map, build_styleid_to_role_depth_map,
-    count_header_rows,
+    count_header_rows, iter_tables_recursive,
 )
 from policy_extractor import _normalize_heading_text
 
@@ -110,43 +110,9 @@ def _run_bold_italic_and_size(paragraph):
 
 
 def _looks_like_typed_heading_pattern(text):
-    """v1.17: literal-text patterns that indicate a GENUINE, typed
-    section-heading numbering scheme (decimal x.y, or 'SECTION N') -
-    used as a safety override so that even a style resolved only via
-    ancestor-chain walking is STILL trusted as a heading if the
-    paragraph's own text unmistakably looks like a real numbered
-    heading. This is deliberately narrow and text-pattern-based only
-    (never reads Word list-numbering/<w:numPr> - see module docstring
-    for why that signal is intentionally avoided here)."""
     return bool(SECTION_BANNER_RE.match(text)) or bool(NUMBERING_RE.match(text))
 
 
-# v1.23 FIX: the v1.17 "untrusted inherited heading" guard was intended
-# to catch narrow TOC/index/outline-mechanics styles that are based on
-# a Heading style ONLY so Word's TOC field can pick them up (e.g. a
-# "TOC 1" style) - NOT real, organization-branded custom heading styles
-# (e.g. "CorpHeading2", "ProposalHeading1") that are extremely common
-# in real Word templates and rely on Word's own multilevel-list
-# auto-numbering (no literal digits in the paragraph's own text).
-#
-# Since this tool must now work correctly for ANY employee's reference
-# template (not a single fixed template), silently discarding a
-# perfectly valid, structurally-resolved heading role match just
-# because the style's own name isn't literally "Heading N" is no
-# longer acceptable - it directly contradicts the requirement that
-# formatting be derived ONLY and FULLY from what's actually present
-# in/inherited from the reference/target document's own style
-# hierarchy, with no arbitrary heuristic override discarding real
-# structural signal. The original v1.17 fix was far broader than its
-# stated intent and silently demoted EVERY custom-named heading-
-# derived style without a literal typed number to Body (at a high,
-# non-flagged 0.55-0.9 confidence), discarding a fully legitimate,
-# high-signal, structural match.
-#
-# This narrow denylist restores trust for legitimate custom heading
-# styles (the overwhelmingly common real-world case) while still
-# protecting against genuine TOC/index/outline-numbering styles the
-# original fix was designed for.
 _UNTRUSTED_STYLE_NAME_MARKERS = ("toc", "index", "outline numbered", "list number")
 
 
@@ -185,9 +151,6 @@ def classify_paragraph(paragraph, body_baseline_pt=11.0, style_name=None,
         }
 
     claimed_role = resolved_role
-    # v1.17: this branch (direct dict lookup of the paragraph's OWN
-    # style name) is ALWAYS a depth-0/literal match by construction -
-    # completely unaffected by this fix, exactly as before.
     if claimed_role is None and style_name in BUILTIN_STYLE_TO_ROLE and style_name != "Normal":
         claimed_role = BUILTIN_STYLE_TO_ROLE[style_name]
         resolved_role_depth = 0
@@ -196,12 +159,6 @@ def classify_paragraph(paragraph, body_baseline_pt=11.0, style_name=None,
         came_from_style_chain = resolved_role is not None
 
     if claimed_role is not None:
-        # v1.23 FIX (see module-level comment above _UNTRUSTED_STYLE_
-        # NAME_MARKERS for full rationale): a HEADING-role match found
-        # by walking UP a style's base_style ancestor chain (depth > 0)
-        # is now only distrusted if the style's OWN name genuinely
-        # looks like a TOC/index/outline-numbering mechanics style -
-        # not merely because it isn't literally named "Heading N".
         is_untrusted_inherited_heading = (
             came_from_style_chain
             and claimed_role in HEADING_ROLES
@@ -221,8 +178,6 @@ def classify_paragraph(paragraph, body_baseline_pt=11.0, style_name=None,
                 }
             return {"role": claimed_role, "confidence": 0.97, "method": "existing_style_or_ancestor",
                     "reason": f"Paragraph style '{style_name}' resolves to role '{claimed_role}'."}
-        # else: intentionally fall through to the heuristic path below,
-        # exactly as if claimed_role had never been resolved at all.
 
     if not text:
         return {"role": "Body", "confidence": 1.0, "method": "empty", "reason": "Empty paragraph."}
@@ -308,9 +263,6 @@ def classify_document(input_path, body_baseline_pt=11.0, special_headings=None):
     doc = Document(input_path)
     styleid_to_name = build_styleid_to_name(doc)
     styleid_to_role = build_styleid_to_role_map(doc, BUILTIN_STYLE_TO_ROLE)
-    # v1.17 NEW: additive depth map (see docx_fast.py) - used only to
-    # decide whether to trust a HEADING-role match; does not replace
-    # or alter styleid_to_role above in any way.
     styleid_to_role_depth = build_styleid_to_role_depth_map(doc, BUILTIN_STYLE_TO_ROLE)
     special_heading_keys = set((special_headings or {}).keys())
 
@@ -327,13 +279,23 @@ def classify_document(input_path, body_baseline_pt=11.0, special_headings=None):
         result.update({"index": idx, "text_preview": p.text.strip()[:80]})
         paragraph_results.append(result)
 
+    # v1.25 FIX (issue #3 - inconsistent table header colors in
+    # documents with NESTED tables, e.g. per-candidate staffing
+    # sub-tables in "Section 3: Experience of the Consortium"):
+    # python-docx's `doc.tables` ONLY returns TOP-LEVEL tables; any
+    # table nested inside a cell was previously completely invisible to
+    # classification, so it silently received zero formatting. This now
+    # walks EVERY table at any nesting depth via iter_tables_recursive,
+    # keyed by a stable structural "path" string (e.g. "6.2-1-0" for a
+    # table nested inside row 2/col 1 of top-level table 6) so the
+    # SAME table is matched correctly later during formatting.
     table_cell_results = []
     table_context_by_index = {}
     table_header_row_count_by_index = {}
-    for t_idx, table in enumerate(doc.tables):
-        table_context_by_index[t_idx] = _classify_target_table_context(table)
+    for path, table in iter_tables_recursive(doc):
+        table_context_by_index[path] = _classify_target_table_context(table)
         hdr_row_count = count_header_rows(table)
-        table_header_row_count_by_index[t_idx] = hdr_row_count
+        table_header_row_count_by_index[path] = hdr_row_count
         n_rows = len(table.rows)
         for r_idx, row in enumerate(table.rows):
             n_cells = len(row.cells)
@@ -342,7 +304,7 @@ def classify_document(input_path, body_baseline_pt=11.0, special_headings=None):
                     result = classify_table_cell_paragraph(p, r_idx, n_rows, n_cells, n_rows,
                                                             header_row_count=hdr_row_count)
                     result.update({
-                        "table_index": t_idx, "row": r_idx, "col": c_idx, "para": p_idx,
+                        "table_index": path, "row": r_idx, "col": c_idx, "para": p_idx,
                         "text_preview": p.text.strip()[:80],
                     })
                     table_cell_results.append(result)
@@ -378,3 +340,4 @@ if __name__ == "__main__":
     with open(args.out, "w", encoding="utf-8") as f:
         json.dump(report, f, indent=2, ensure_ascii=False)
     print(f"[structure_classifier] {report['summary']}")
+

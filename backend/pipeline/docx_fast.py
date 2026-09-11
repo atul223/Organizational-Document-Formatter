@@ -201,12 +201,9 @@ def table_header_signature(table, header_row_count):
     for a table, based on its NORMALIZED header cell texts (upper-
     cased, whitespace-collapsed) joined across all header rows, plus
     its column count. Two tables sharing the exact same header text
-    (e.g. every "No. | Activity | Description | Timing" activity table
-    that recurs throughout a document) are considered the SAME shape
-    for the purposes of row-banding pattern detection/matching - see
-    policy_extractor.extract_body_row_banding for the full rationale.
-    Returns None if the table has no header cells to build a signature
-    from at all (e.g. an empty table)."""
+    are considered the SAME shape for the purposes of row-banding
+    pattern detection/matching. Returns None if the table has no
+    header cells to build a signature from at all."""
     import re
     cells = header_row_cells(table, header_row_count)
     if not cells:
@@ -215,6 +212,56 @@ def table_header_signature(table, header_row_count):
     if not any(texts):
         return None
     return "col{}::{}".format(len(texts), "|".join(texts))
+
+
+# ---------------------------------------------------------------------
+# v1.25 NEW: recursive table traversal (handles NESTED tables placed
+# inside a table cell - e.g. a per-candidate "Team Leader / Sanitary
+# Engineer / ..." sub-table nested inside a larger PDS-style project
+# table). python-docx's `document.tables` ONLY returns TOP-LEVEL
+# tables - any table nested inside a cell is completely invisible to
+# it. Every part of this pipeline that iterates `doc.tables` directly
+# therefore silently skips every nested table, leaving them with zero
+# formatting applied (this was directly confirmed as the root cause of
+# inconsistent header-row shading in documents with per-candidate
+# nested tables, e.g. "Section 3: Experience of the Consortium").
+#
+# This generator yields (path, table) for EVERY table in the document,
+# at any nesting depth, where `path` is a stable, JSON-key-safe STRING
+# identifier that encodes the table's exact structural location (e.g.
+# "3" for top-level table 3, or "3.1-2-0" for the 0th table nested
+# inside row 1 / col 2 of table 3). Because `path` is derived purely
+# from structural location (not from iteration order), the SAME path
+# always refers to the SAME table across two SEPARATE calls (e.g. one
+# during classification/policy-extraction, one during formatting
+# application) - this is what allows classification results to be
+# safely serialized to JSON and re-matched later.
+# ---------------------------------------------------------------------
+
+def iter_tables_recursive(doc_or_cell):
+    """Yields (path, table) for every table in `doc_or_cell` (a Document
+    or a _Cell), including tables nested at any depth inside cells."""
+    try:
+        top_tables = doc_or_cell.tables
+    except AttributeError:
+        top_tables = []
+
+    def _walk(tables, prefix):
+        for t_idx, table in enumerate(tables):
+            path = f"{prefix}{t_idx}" if prefix == "" else f"{prefix}.{t_idx}"
+            yield path, table
+            seen_tc_ids = set()
+            for r_idx, row in enumerate(table.rows):
+                for c_idx, cell in enumerate(row.cells):
+                    if id(cell._tc) in seen_tc_ids:
+                        continue
+                    seen_tc_ids.add(id(cell._tc))
+                    nested = cell.tables
+                    if nested:
+                        nested_prefix = f"{path}.{r_idx}-{c_idx}-"
+                        yield from _walk(nested, nested_prefix)
+
+    yield from _walk(top_tables, "")
 
 
 # ---------------------------------------------------------------------
@@ -298,3 +345,4 @@ def clear_cnf_style(element_with_tcpr_or_trpr, is_row=False):
     cnf = container.find(qn('w:cnfStyle'))
     if cnf is not None:
         container.remove(cnf)
+
