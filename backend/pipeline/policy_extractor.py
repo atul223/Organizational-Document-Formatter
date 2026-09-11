@@ -100,19 +100,29 @@ ROLE_STYLE_CANDIDATES = {
 MAJOR_FONT_ROLES = {"Title", "H1", "H2", "H3", "H4"}
 MINOR_FONT_ROLES = {"Body", "Caption", "Quote", "ListBullet"}
 
-HEADING_USAGE_OVERRIDE_ROLES = {"Title", "H1", "H2", "H3", "H4"}
+# v1.24 FIX: previously only MAJOR_FONT_ROLES (headings) were subject to
+# usage-based majority-vote override of the (possibly stale) style
+# definition. Body/Caption/Quote/ListBullet were left on style-definition
+# values ONLY, which silently produced wrong output whenever a reference
+# document's "Normal"/etc. style definition was stale (e.g. style says
+# "Arial 9.5" but every actual paragraph in the document has been
+# manually/directly formatted to "Times New Roman 11", which is what a
+# human actually sees when opening the file). Per the explicit
+# requirement that the tool must reproduce "whatever is visible in the
+# reference document actually... without any discrepancies", usage-based
+# override now applies to EVERY typography role, not just headings.
+ALL_TYPOGRAPHY_USAGE_OVERRIDE_ROLES = MAJOR_FONT_ROLES | MINOR_FONT_ROLES
+# Back-compat alias (kept in case anything external referenced the old
+# name) - identical set, just scoped to heading roles conceptually.
+HEADING_USAGE_OVERRIDE_ROLES = MAJOR_FONT_ROLES
 
 BODY_LIKE_FONT_NAME_USAGE_ROLES = {"Body", "Caption", "Quote", "ListBullet"}
-# v1.23: lowered from (5, 0.6) to (1, 0.5). Per updated product requirement,
-# the tool must be usable with ANY employee-supplied reference template of
-# ANY size/length - it must apply whatever is ACTUALLY, deterministically
-# present in the reference rather than silently withholding a real,
-# correctly-extracted value merely because the reference didn't contain a
-# large statistical sample. A single genuine usage example in the
-# reference is real evidence, not a guess, and is now honored. The
-# majority-ratio check (now simple >50%) is retained ONLY to break ties
-# when the reference itself contains multiple, mutually-inconsistent
-# examples for the same role - never used to withhold real data.
+# v1.23: lowered from (5, 0.6) to (1, 0.5) - see extract_minor_role_font_
+# name_from_usage() docstring. This function is now mostly a SECONDARY
+# safety net (see v1.24 change above, which already handles the primary
+# case via full usage-based override), retained for the rare edge case
+# where a role has literally zero paragraphs resolving to it anywhere
+# in the reference document.
 MIN_MINOR_FONT_NAME_SAMPLES = 1
 MIN_MINOR_FONT_NAME_MAJORITY_RATIO = 0.5
 
@@ -143,7 +153,16 @@ SPECIAL_HEADING_TEXTS = [
 ]
 
 TOC_HEADING_NORM = "TABLE OF CONTENTS"
+
+# v1.24: this word-count cap is now ONLY applied to heading-like roles
+# (see ROLES_WITH_USAGE_WORD_COUNT_LIMIT below). It exists to stop a
+# long, misclassified paragraph from skewing a HEADING's usage vote
+# (headings are, by nature, short). Body/Caption/Quote/ListBullet text
+# is legitimately long and must be sampled regardless of length -
+# otherwise the vast majority of real body paragraphs would be
+# excluded from the vote, defeating the fix's whole purpose.
 MAX_USAGE_SAMPLE_WORDS = 20
+ROLES_WITH_USAGE_WORD_COUNT_LIMIT = MAJOR_FONT_ROLES
 
 
 def _normalize_heading_text(text):
@@ -215,6 +234,14 @@ def _paragraph_props(style):
 
 
 def extract_typography_from_style_defs(doc, reference_path):
+    """Baseline pass: reads each role's STYLE DEFINITION (e.g. what
+    Word's 'Normal' style itself declares). This is later treated only
+    as a fallback baseline - see extract_typography_from_usage() below,
+    which overrides these values with what's ACTUALLY, visibly used in
+    the document whenever real usage data is available, since a style
+    definition can be stale/never-updated even though every real
+    paragraph in the document has direct/manual formatting on top of
+    it (a very common real-world Word authoring pattern)."""
     styles_by_name = {s.name: s for s in doc.styles}
     typography = {}
     for role, candidates in ROLE_STYLE_CANDIDATES.items():
@@ -267,23 +294,67 @@ def extract_typography_from_style_defs(doc, reference_path):
     return typography
 
 
-def extract_heading_typography_from_usage(doc, base_typography):
+def extract_typography_from_usage(doc, base_typography):
+    """v1.24 RENAMED + EXPANDED (was extract_heading_typography_from_
+    usage, and only ever examined HEADING roles). This function now
+    examines EVERY typography role - Title/H1-H4 AND Body/Caption/
+    Quote/ListBullet - and, for each role, votes on the font/paragraph
+    properties ACTUALLY applied via direct/manual run-level formatting
+    across every matching paragraph in the reference document.
+
+    Rationale (root cause of the "Arial 9.5 instead of Times New Roman
+    11" bug): a paragraph style's own definition (e.g. 'Normal') can be
+    stale - authored once, then never updated - while every real
+    paragraph using that style has since been manually reformatted
+    (e.g. selecting all body text and changing the font). Word renders
+    the direct/manual formatting, so THAT is what a human actually sees
+    as "the reference document's formatting" - not the stale style
+    default. Since the tool's mandate is to reproduce exactly what is
+    visibly present in the reference with no discrepancies, usage
+    (i.e. what's actually applied, majority-voted across every real
+    paragraph) must always take priority over a style definition
+    whenever real usage data exists - for ALL roles, not only headings.
+
+    A single genuine usage example is sufficient evidence (n_samples
+    >= 1) per the "any employee, any reference template" requirement -
+    even a short reference document's real, observed formatting must
+    be honored rather than silently discarded for lack of a large
+    statistical sample.
+    """
     styleid_to_role = build_styleid_to_role_map(doc, BUILTIN_STYLE_TO_ROLE)
 
     votes = {role: {
         "name": Counter(), "size_pt": Counter(), "color_hex": Counter(),
         "bold": [], "italic": [],
         "alignment": Counter(), "space_before_pt": Counter(), "space_after_pt": Counter(),
-    } for role in HEADING_USAGE_OVERRIDE_ROLES}
+    } for role in ALL_TYPOGRAPHY_USAGE_OVERRIDE_ROLES}
     sample_counts = Counter()
 
     for p in doc.paragraphs:
         text = p.text.strip()
-        if not text or len(text.split()) > MAX_USAGE_SAMPLE_WORDS:
+        if not text:
             continue
         style_id = get_raw_pstyle_id(p)
-        role = styleid_to_role.get(style_id) if style_id else None
-        if role is None or role not in HEADING_USAGE_OVERRIDE_ROLES:
+        # v1.24 FIX: Word/python-docx frequently omits the explicit
+        # <w:pStyle> element entirely for paragraphs using the
+        # DEFAULT "Normal" style (it's the implicit default per the
+        # OOXML spec, so there's often nothing to write). The old
+        # "if style_id else None" pattern silently treated every such
+        # paragraph as having NO resolvable role at all, excluding the
+        # overwhelming majority of real body text from usage voting -
+        # defeating this entire fix for exactly the most common case.
+        # A missing style_id must resolve to "Body" (matching
+        # BUILTIN_STYLE_TO_ROLE["Normal"] == "Body"), not to "no role".
+        if style_id is None:
+            role = "Body"
+        else:
+            role = styleid_to_role.get(style_id)
+        if role is None or role not in ALL_TYPOGRAPHY_USAGE_OVERRIDE_ROLES:
+            continue
+        # v1.24: the word-count cap is only meaningful/applied for
+        # heading-like roles (see constant definition above); body-like
+        # roles sample every paragraph regardless of length.
+        if role in ROLES_WITH_USAGE_WORD_COUNT_LIMIT and len(text.split()) > MAX_USAGE_SAMPLE_WORDS:
             continue
         rep_run = next((r for r in p.runs if r.text.strip()), None)
         if rep_run is None:
@@ -334,7 +405,7 @@ def extract_heading_typography_from_usage(doc, base_typography):
 
     result = {}
     for role, base in base_typography.items():
-        if role not in HEADING_USAGE_OVERRIDE_ROLES:
+        if role not in ALL_TYPOGRAPHY_USAGE_OVERRIDE_ROLES:
             result[role] = base
             continue
 
@@ -342,18 +413,18 @@ def extract_heading_typography_from_usage(doc, base_typography):
         para = dict(base.get("paragraph", {}))
         v = votes.get(role)
         n_samples = sample_counts.get(role, 0)
-        # v1.23: lowered from >= 2 to >= 1 - a single genuine usage
-        # example found directly in the reference document IS real,
-        # extracted evidence (not a guess) and must be honored, per the
-        # "any employee, any reference template" requirement. This
-        # previously silently discarded real data whenever a role
-        # (e.g. H3) only appeared once in a short reference document.
+        # v1.23/v1.24: a single genuine usage example (n_samples >= 1)
+        # is real, extracted evidence - not a guess - and OVERRIDES the
+        # (possibly stale) style-definition baseline. This is the
+        # direct fix for the "Body style says Arial 9.5, but every
+        # actual paragraph is Times New Roman 11" class of bug.
         if v and n_samples >= 1:
             if v["name"]:
                 font["name"] = v["name"].most_common(1)[0][0]
                 font["name_source"] = "usage_majority"
             if v["size_pt"]:
                 font["size_pt"] = v["size_pt"].most_common(1)[0][0]
+                font["size_source"] = "usage_majority"
             if v["bold"]:
                 font["bold"] = sum(v["bold"]) >= len(v["bold"]) / 2.0
             if v["italic"]:
@@ -378,6 +449,15 @@ def extract_heading_typography_from_usage(doc, base_typography):
 
 
 def extract_minor_role_font_name_from_usage(doc, typography):
+    """SECONDARY safety net only (see extract_typography_from_usage()
+    above, which is now the PRIMARY mechanism and already covers this
+    case for any role with at least one real paragraph in the
+    document). This function only ever fires if a role's font name is
+    STILL empty after that primary pass - i.e. the role has literally
+    zero paragraphs resolving to it anywhere in the reference document
+    - in which case it re-scans using a slightly different resolution
+    path as a last-resort cross-check before falling back to theme/
+    body-inherited defaults."""
     roles_needing_fallback = {
         role for role in BODY_LIKE_FONT_NAME_USAGE_ROLES
         if not typography.get(role, {}).get("font", {}).get("name")
@@ -391,7 +471,13 @@ def extract_minor_role_font_name_from_usage(doc, typography):
 
     for p in doc.paragraphs:
         style_id = get_raw_pstyle_id(p)
-        role = styleid_to_role.get(style_id) if style_id else None
+        # v1.24 FIX: same None-style_id fix as in extract_typography_
+        # from_usage() above - see that function's inline comment for
+        # the full rationale.
+        if style_id is None:
+            role = "Body"
+        else:
+            role = styleid_to_role.get(style_id)
         if role is None or role not in roles_needing_fallback:
             continue
         for r in p.runs:
@@ -423,8 +509,10 @@ def extract_minor_role_font_name_from_usage(doc, typography):
 
 def extract_typography(doc, reference_path):
     base = extract_typography_from_style_defs(doc, reference_path)
-    with_heading_usage = extract_heading_typography_from_usage(doc, base)
-    final = extract_minor_role_font_name_from_usage(doc, with_heading_usage)
+    # v1.24: usage-based override now runs for ALL roles (headings AND
+    # body-like), not just headings - see extract_typography_from_usage().
+    with_usage = extract_typography_from_usage(doc, base)
+    final = extract_minor_role_font_name_from_usage(doc, with_usage)
     return final
 
 
@@ -1356,12 +1444,9 @@ def extract_table_contexts(doc):
     # v1.23: threshold dropped from 0.7 to a simple majority (>0.5).
     # Per updated requirement, ANY genuine majority pattern found in the
     # reference (regardless of how few tables the reference contains)
-    # must be applied deterministically - the tool must not withhold a
-    # real extracted pattern just because it isn't "confidently"
-    # consistent by an arbitrary statistical bar. "apply: False" is now
-    # reserved ONLY for the case where the reference genuinely contains
-    # NO examples at all (cell_count == 0) - i.e. truly no data to
-    # extract, not "not enough of it".
+    # must be applied deterministically. "apply: False" is now reserved
+    # ONLY for the case where the reference genuinely contains NO
+    # examples at all (cell_count == 0).
     def _build_profile(shading_votes, color_votes, bold_votes, table_count, cell_count, threshold=0.5):
         if cell_count == 0:
             return {"apply": False, "reason": "no matching tables/cells found in reference document "
@@ -1496,15 +1581,13 @@ def _row_effective_shading_or_none(row, table, body_row_parity):
 def _vote_banding_for_table_group(tables):
     """v1.22 NEW: runs the SAME parity-vote algorithm as before, but
     scoped to a specific GROUP of tables (all sharing one header
-    signature) rather than the whole document. This is the core of the
-    fix - see module docstring for the full rationale.
+    signature) rather than the whole document.
 
     v1.23: MIN_BANDING_SAMPLES_PER_PARITY and MIN_BANDING_CONFIDENCE
-    were lowered (see module-level constants) so that a reference
-    document with only a small number of body rows (very plausible for
-    a short reference template supplied by any employee) still has its
-    real, observed banding pattern honored, rather than silently
-    skipped for lack of a large statistical sample.
+    were lowered so that a reference document with only a small number
+    of body rows still has its real, observed banding pattern honored,
+    rather than silently skipped for lack of a large statistical
+    sample.
     """
     parity_votes = [Counter(), Counter()]
     parity_sample_counts = [0, 0]
@@ -1582,18 +1665,10 @@ def _vote_banding_for_table_group(tables):
 def extract_body_row_banding(doc):
     """
     v1.22: GROUPS all reference data tables by their own header "shape
-    signature" (see docx_fast.table_header_signature) and runs the
-    parity-vote banding algorithm SEPARATELY, per group - see module
-    docstring for the full, directly-confirmed root-cause rationale.
-    Also computes a single "default" fallback profile (the OLD whole-
-    document vote across every table, unchanged) for target tables
+    signature" and runs the parity-vote banding algorithm SEPARATELY,
+    per group. Also computes a single "default" fallback profile (the
+    OLD whole-document vote across every table) for target tables
     whose header signature matches nothing seen in the reference.
-
-    Returns:
-        {
-          "by_signature": {sig_string: <profile>, ...},
-          "default": <profile>  # same shape as v1.19-v1.21's single result
-        }
     """
     groups = {}
     for tbl in doc.tables:
@@ -1643,7 +1718,7 @@ def build_policy(reference_path):
     typography = extract_typography(doc, reference_path)
     theme_fonts = extract_theme_fonts(reference_path)
     policy = {
-        "policy_version": "1.23",
+        "policy_version": "1.24",
         "source_reference_document": reference_path,
         "theme_fonts": theme_fonts,
         "typography": typography,
@@ -1673,13 +1748,16 @@ def main():
     with open(args.out, "w", encoding="utf-8") as f:
         json.dump(policy, f, indent=2, ensure_ascii=False)
     print(f"[policy_extractor] Wrote {args.out}")
-    banding = policy['table_row_banding']
-    print(f"[policy_extractor] Table row banding: {len(banding['by_signature'])} table shape(s) detected")
-    for sig, profile in banding['by_signature'].items():
-        print(f"  {sig[:60]}: apply={profile.get('apply')} {profile.get('band_colors', '')}")
-    print(f"  [default fallback]: apply={banding['default'].get('apply')}")
+    typ = policy["typography"]
+    for role in ("Title", "H1", "H2", "H3", "H4", "Body", "Caption", "Quote", "ListBullet"):
+        f = typ.get(role, {}).get("font", {})
+        print(f"  {role}: font={f.get('name')} (source: {f.get('name_source', 'style_default')}), "
+              f"size={f.get('size_pt')}pt (source: {f.get('size_source', 'style_default')}), "
+              f"usage_samples={typ.get(role, {}).get('usage_sample_size', 0)}")
 
 
 if __name__ == "__main__":
     main()
+
+
 
